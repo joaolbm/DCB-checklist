@@ -10,6 +10,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 <style>
 :root{
   --carvao-0:#141110;
@@ -347,6 +349,25 @@ a{color:inherit;}
 .empty-state{text-align:center;padding:50px 20px;color:var(--creme-fosco);}
 .empty-state .ic{font-size:38px;margin-bottom:12px;}
 
+.sync-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.sync-dot.on{background:var(--alface);box-shadow:0 0 0 3px rgba(76,154,42,.18);}
+.sync-dot.off{background:var(--tomate);}
+.sync-dot.loading{background:var(--queijo);animation:pulseDot 1s infinite;}
+@keyframes pulseDot{0%,100%{opacity:1;}50%{opacity:.35;}}
+.sync-label{font-size:10px;color:var(--creme-fosco);}
+
+.boot-screen{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center;}
+.boot-screen .brand-mark{width:56px;height:56px;font-size:26px;border-radius:14px;margin-bottom:16px;}
+.boot-screen p{color:var(--creme-fosco);font-size:13px;margin-top:10px;}
+.boot-spinner{width:28px;height:28px;border-radius:50%;border:3px solid var(--carvao-3);border-top-color:var(--brasa);animation:spin .8s linear infinite;margin-top:6px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.setup-banner{
+  background:rgba(194,59,59,.1);border:1px solid var(--tomate);border-radius:14px;padding:14px 16px;margin-bottom:16px;
+}
+.setup-banner b{color:var(--tomate);}
+.setup-banner p{font-size:12.5px;color:var(--creme-fosco);margin-top:4px;line-height:1.5;}
+
 .chart-wrap{background:var(--carvao-1);border:1px solid var(--borda);border-radius:16px;padding:16px;margin-bottom:14px;height:260px;position:relative;}
 .chart-wrap h3{font-size:13px;margin-bottom:10px;color:var(--creme-fosco);text-transform:uppercase;letter-spacing:.5px;}
 
@@ -375,6 +396,27 @@ a{color:inherit;}
    ========================================================= */
 
 const STORAGE_KEY = 'dcb_state_v1';
+
+/* =========================================================
+   CONFIGURAÇÃO FIREBASE — sincronização entre celulares
+   =========================================================
+   Cole aqui o objeto "firebaseConfig" que o Firebase te dá
+   ao criar seu projeto (veja o passo a passo que te enviei).
+   Enquanto estiver vazio, o sistema funciona normalmente,
+   mas cada aparelho fica com dados separados (sem sincronizar).
+   ========================================================= */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCaFJ8OXjFp8B4TQ39dc_kbkqWCfeZ0p_o",
+  authDomain: "dom-cellebre-burger-checklist.firebaseapp.com",
+  projectId: "dom-cellebre-burger-checklist",
+  storageBucket: "dom-cellebre-burger-checklist.firebasestorage.app",
+  messagingSenderId: "326998674677",
+  appId: "1:326998674677:web:a91ca4cf7bbca64329c9bc",
+};
+const FIREBASE_ATIVO = !!FIREBASE_CONFIG.apiKey;
+let db = null;
+let syncStatus = FIREBASE_ATIVO ? 'loading' : 'off'; // loading | on | off | error
+let bootDone = !FIREBASE_ATIVO; // sem firebase, já pode renderizar direto
 
 const USERS = [
   {id:'joao', nome:'João', role:'admin'},
@@ -445,24 +487,66 @@ function defaultState(){
   };
 }
 
-function loadState(){
+function mergeWithDefaults(parsed){
+  const base = defaultState();
+  if(!parsed) return base;
+  return {...base, ...parsed, templates: parsed.templates || base.templates, unidades: parsed.unidades || base.unidades, checklists: parsed.checklists || [], resetHistorico: parsed.resetHistorico || []};
+}
+
+function loadStateLocal(){
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
-    if(!raw) { const s = defaultState(); saveState(s); return s; }
-    const parsed = JSON.parse(raw);
-    // merge com defaults pra garantir campos novos
-    const base = defaultState();
-    return {...base, ...parsed, templates: parsed.templates || base.templates, unidades: parsed.unidades || base.unidades};
+    if(!raw){ const s = defaultState(); localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); return s; }
+    return mergeWithDefaults(JSON.parse(raw));
   }catch(e){
-    console.error('Erro ao carregar estado', e);
+    console.error('Erro ao carregar estado local', e);
     return defaultState();
   }
 }
+
 function saveState(s){
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+  state = s;
+  if(FIREBASE_ATIVO && db){
+    db.collection('dcb').doc('estado').set(s).catch(e=>{
+      console.error('Erro ao salvar na nuvem', e);
+      syncStatus = 'error';
+    });
+  } else {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+  }
 }
 
-let state = loadState();
+function initFirebase(){
+  try{
+    firebase.initializeApp(FIREBASE_CONFIG);
+    db = firebase.firestore();
+    const docRef = db.collection('dcb').doc('estado');
+    docRef.onSnapshot(snap=>{
+      if(snap.exists){
+        state = mergeWithDefaults(snap.data());
+      } else {
+        state = defaultState();
+        docRef.set(state);
+      }
+      syncStatus = 'on';
+      bootDone = true;
+      render();
+    }, err=>{
+      console.error('Erro de sincronização', err);
+      syncStatus = 'error';
+      if(!bootDone){ state = loadStateLocal(); bootDone = true; }
+      render();
+    });
+  }catch(e){
+    console.error('Falha ao iniciar Firebase', e);
+    syncStatus = 'error';
+    state = loadStateLocal();
+    bootDone = true;
+    render();
+  }
+}
+
+let state = FIREBASE_ATIVO ? defaultState() : loadStateLocal();
 let session = { userId: null }; // sessão não persiste entre fechamentos de app por segurança simples
 let currentSetup = { unidade:null, setor:null, tipo:null };
 let currentChecklistId = null;
@@ -476,6 +560,7 @@ function currentUser(){ return USERS.find(u=>u.id===session.userId) || null; }
 function isAdmin(){ const u=currentUser(); return u && u.role==='admin'; }
 
 function render(){
+  if(!bootDone){ renderBootScreen(); return; }
   if(!session.userId){ renderLogin(); return; }
   if(!currentSetup.unidade || !currentSetup.setor || !currentSetup.tipo){
     // admins podem pular direto pro dashboard/config via nav; mas fluxo padrão pede setup
@@ -483,6 +568,17 @@ function render(){
     return;
   }
   renderShell(renderMain());
+}
+
+function renderBootScreen(){
+  app.innerHTML = `
+    <div class="boot-screen">
+      <div class="brand-mark">D</div>
+      <div style="font-family:'Archivo Black';font-size:16px;">Dom Cellebre Burger</div>
+      <div class="boot-spinner"></div>
+      <p>Conectando aos dados da equipe...</p>
+    </div>
+  `;
 }
 
 function renderShell(innerHTML){
@@ -493,7 +589,10 @@ function renderShell(innerHTML){
         <div class="brand-mark">D</div>
         <div class="brand-text">
           <div class="t1">Dom Cellebre Burger</div>
-          <div class="t2">Checklist operacional</div>
+          <div class="t2" style="display:flex;align-items:center;gap:5px;">
+            <span class="sync-dot ${syncStatus==='on'?'on':syncStatus==='loading'?'loading':'off'}"></span>
+            <span class="sync-label" style="text-transform:none;letter-spacing:0;">${syncStatus==='on'?'sincronizado':syncStatus==='loading'?'conectando':FIREBASE_ATIVO?'sem conexão':'sem sincronização'}</span>
+          </div>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:10px;">
@@ -504,6 +603,13 @@ function renderShell(innerHTML){
         <button class="btn-icon" onclick="handleLogout()" title="Sair">⏻</button>
       </div>
     </div>
+    ${!FIREBASE_ATIVO && u.role==='admin' ? `
+    <div class="container" style="padding-bottom:0;">
+      <div class="setup-banner">
+        <b>Sincronização entre celulares desativada.</b>
+        <p>Os dados deste aparelho não estão sendo compartilhados com a equipe. Configure o Firebase no arquivo do sistema para que todos vejam os mesmos checklists em tempo real.</p>
+      </div>
+    </div>` : ''}
     <div class="container" style="padding-bottom:6px;">${innerHTML}</div>
     ${renderBottomNav()}
     ${toastMsg ? renderToast() : ''}
@@ -1344,7 +1450,12 @@ function afterRenderHooks(){
 }
 
 /* ================= INIT ================= */
-render();
+if(FIREBASE_ATIVO){
+  initFirebase();
+  render(); // mostra tela de conexão enquanto aguarda o primeiro snapshot
+} else {
+  render();
+}
 </script>
 </body>
 </html>
